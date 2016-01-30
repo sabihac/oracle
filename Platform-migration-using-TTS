@@ -1,0 +1,1435 @@
+
+ORACLE DATABASE PLATFORM MIGRATION USING TRANSPORTABLE TABLESPACES
+
+Index
+
+Phase 1: Initial Setup..............................................................................................3
+1.1  Check Prerequisites..............................................................................3
+1.2  Install Oracle Database Software..........................................................4
+
+
+Phase 2: Prepare the Source and Target Databases..............................................5
+2.1  Create target database........................................................................5
+2.2  Prepare Target and Source Databases...............................................13
+
+Phase 3: Perform the Transport...........................................................................16
+3.1  Shutdown the application...................................................................16
+3.2   Export OLAP Analytic Workspaces.....................................................16 
+3.3   Make All User Tablespaces READ ONLY..............................................17
+3.4   Export Tablespaces from Source Database..........................................17 
+3.5   Perform Post-Transport Actions on the Target Database..................28
+
+Phase 4: Verify and Backup the New Target Database.........................................32
+
+4.1   Gather Verification Information from Source Database....................32
+4.2   Perform Application-specific Verification..........................................34
+4.3   Verify and Gather Optimizer Statistics...............................................34
+4.4   Backup the target database...............................................................35
+4.5   Verify the Transported Datafiles........................................................35 
+4.6   Start the Application..........................................................................35
+
+References............................................................................................................36
+
+
+Note: All the scripts referenced in the document are from www.oracle.com/technetwork/database/features/availability/maa-wp-11g-platformmigrationtts-129269.pdf
+
+
+
+
+
+Phase 1:  INITIAL SETUP
+
+
+1.1  Check Prerequisites
+
+1.1.1  Determine if Source and Target Platforms Are Supported
+
+1.	Run the following query to determine the platform name and endian format of the source database:
+
+ON SOURCE
+
+SQL> SELECT D.PLATFORM_NAME, ENDIAN_FORMAT FROM V$TRANSPORTABLE_PLATFORM TP, V$DATABASE D WHERE TP.PLATFORM_NAME = D.PLATFORM_NAME; 
+
+PLATFORM_NAME                                    ENDIAN_FORMAT
+----------------------------------------------      ------------------------
+HP-UX IA (64-bit)                                         Big
+
+2.	Query the V$TRANSPORTABLE_PLATFORM view to determine support for the target platform:
+
+ON SOURCE
+SQL> SELECT PLATFORM_NAME, ENDIAN_FORMAT  FROM V$TRANSPORTABLE_PLATFORM; 
+PLATFORM_NAME                          ENDIAN_FORMAT
+-----------------------------------            --------------
+Solaris[tm] OE (32-bit)                       Big
+Solaris[tm] OE (64-bit)                       Big
+Microsoft Windows IA (32-bit)         Little
+Linux IA (32-bit)                                   Little
+AIX-Based Systems (64-bit)                Big
+HP-UX (64-bit)                                      Big
+HP Tru64 UNIX                                     Little
+HP-UX IA (64-bit)                                 Big
+Linux IA (64-bit)                                   Little
+HP Open VMS                                      Little
+Microsoft Windows IA (64-bit)         Little
+IBM zSeries Based Linux                    Big
+Linux x86 64-bit                                   Little
+Apple Mac OS                                      Big
+Microsoft Windows x86 64-bit         Little
+Solaris Operating System (x86)        Little
+IBM Power Based Linux                     Big
+HP IA Open VMS                                  Little
+Solaris Operating System (x86-64)   Little
+Apple Mac OS (x86-64)                       Little
+
+1.2 Install Oracle Database Software 
+
+On the target system, install the same software version, patch set release, and critical patch update that is running on the source system.
+
+1.2.1  Handle Objects in the SYSTEM or SYSAUX Tablespaces
+
+Because XTTS does not move objects that reside in the SYSTEM or SYSAUX tablespaces of the source database, the following conditions warrant special consideration 
+
+
+•	Metadata residing in the SYSTEM or SYSAUX tablespaces 
+•	SYSTEM-owned objects residing in the SYSTEM or SYSAUX tablespaces 
+•	User objects residing in the SYSTEM or SYSAUX tablespaces 
+
+1.	Metadata residing in the SYSTEM or SYSAUX tablespaces 
+Database metadata includes views, synonyms, type definitions, database links, PL/SQL packages, roles, Java classes, privileges, sequences, and other objects. Running a full database, metadata-only import creates database metadata that is not automatically created in the target database by the transport process. This will be accomplished later with with two separate import processes.
+
+2.	SYSTEM-owned objects residing in the SYSTEM or SYSAUX tablespaces 
+Some applications create tables and indexes owned by the SYSTEM user that are required for proper application functionality. To properly identify these objects requires application-specific knowledge. You must move these objects to the target database manually with Data Pump, or manually re-create the objects after performing the platform migration.
+
+
+3.	User-Owned Tables Residing in the SYSTEM or SYSAUX Tablespaces 
+
+ON SOURCE
+
+tts_system_user_obj.sql
+
+SQL> select owner, segment_name, segment_type from dba_segments where tablespace_name in ('SYSTEM', 'SYSAUX') and owner not in (select name from system.logstdby$skip_support where action=0);
+
+
+Migrate objects listed in the above query to user tablespaces on the source database before proceeding. This can be ignored if the above query results in no rows selected.
+
+
+
+Phase 2: PREPARE THE SOURCE AND TARGET DATABASE 
+
+2.1  Create target database
+
+Create a new database on the target system. The new target database consists initially of just SYSTEM, SYSAUX, UNDO, temporary tablespaces, and user tablespaces. The recommended method of creating the target database is to use DBCA. When creating the target database, note the following:
+
+• Although all user tablespaces from the original source database will be transported and plugged into the new target database during a later step, initially the target database must contain placeholder tablespaces for the user tablespaces that will be transported. The size of the user tablespaces initially created in the target database can be small; the target tablespaces do not have to match the sizes in the source database. The placeholder tablespaces will be dropped from the target database before transporting the tablespaces from the source system.
+
+• The sizes of the SYSTEM, SYSAUX, UNDO, and temporary tablespaces must be the same size or larger than those tablespaces on the source database.
+
+2.1.1 Edit TNSNAMES 
+
+ON TARGET HOST
+Edit Tnsnames to point to source ORCL database on HP-UX IA
+$ vi tnsnames.ora
+
+2.1.2 DST Patch Version
+
+ON SOURCE
+Check the dst patch version on source
+SQL> SELECT NAME, VALUE$ FROM PROPS$ WHERE NAME='DST_PRIMARY_TT_VERSION';
+
+NAME	                                        VALUE$
+------------------------------------    --------------------------------------------------------------------------------
+DST_PRIMARY_TT_VERSION  4
+
+
+For Oracle 11g a new database will be automatically created with DST patch 14. Since the DST patch version is supposed to be same on both the database, perform the following steps on target database before creating a new database.
+
+ON TARGET 
+Cd $ORACLE_HOME/oracore/zoneinfo
+
+Move timezlrg_*.dat  and  timezone_*.dat  files with *=number greater than version mentioned above in VALUE$ (VALUE$ IS 4 IN THE ABOVE EXAMPLE) column to another folder. 
+2.1.3 Launch DBCA
+Launch DBCA or use the dbca command to create a Template from the source database
+
+ON SOURCE
+
+$ dbca -silent -createTemplateFromDB -sourceSID ORCL -templateName ORCLTemplate -sysDBAUserName SYS -sysDBAPassword sys -maintainFileLocations true
+
+
+$  dbca -silent -generateScripts  -templateName ORCLTemplate.dbt -gdbName orcl -scriptDest /home/oracle/working/orcl_scripts/
+
+Database creation script generation
+1% complete
+..........
+100% complete
+Look at the log file "/home/oracle/working/orcl_scripts/orcl.log" for further details.
+
+
+2.1.4 Edit scripts generated by DBCA
+On target host
+
+•	Edit scripts that are created from DBCA to change file paths if the paths are different on target. You can reduce the sizes of all user tablespaces as they would be deleted at a later step.
+•	Also increase size of SYSTEM, SYSAUX AND UNDO in the script.
+•	Size of redo should be the same or larger
+•	Edit the pfile if any paths are being changed.
+•	Start DB creation on target host
+
+ON TARGET
+unset ORACLE_HOME
+unset ORACLE_SID
+
+cd /home/oracle/working/orcl_scripts/
+
+./ORCL.sh
+
+2.1.5  Create TDE Encryption Wallet
+
+After the database is created on target. Create TDE encryption wallet if it exists on Source database.
+
+Check if the source database is using TDE encryption
+
+ON SOURCE
+SQL>SELECT COUNT(*) FROM DBA_TABLESPACES WHERE ENCRYPTED='YES';
+SQL>select * from V$ENCRYPTION_WALLET;
+
+
+ON TARGET 
+
+SQL> select * from V$ENCRYPTION_WALLET;
+
+SQL> ALTER SYSTEM SET ENCRYPTION KEY IDENTIFIED BY "myPassword";
+
+Wallets must be reopened after an instance restart and can be closed to prevent access to encrypted data.
+
+SQL> ALTER SYSTEM SET ENCRYPTION WALLET OPEN IDENTIFIED BY "myPassword";
+
+2.1.6  Backup the target database
+After the db creation is completed on target host, take a full RMAN backup of the newly created database
+
+ON TARGET
+$ rman target /
+
+Recovery Manager: Release 11.2.0.2.0 - Production on Tue Aug 7 00:00:00 2012
+
+Copyright (c) 1982, 2009, Oracle and/or its affiliates.  All rights reserved.
+
+connected to target database: orcl (DBID=2743061371)
+
+RMAN> backup database;
+backup current controlfile;
+backup spfile;
+
+2.1.7  Create Tablespaces
+
+Make sure that all user tablespaces exist on target database. If not then create them with the following commands:
+Sizes can be smaller than source db tablespaces
+
+Create unencrypted tablespaces
+
+ON SOURCE DATABASE
+Script to create unencrypted tablespaces
+
+SET LINES 500 PAGES 500
+SET HEADING OFF
+SET FEEDBACK OFF
+SPOOL create_unencr_tablespace.sql
+
+select 'CREATE TABLESPACE ' ||a.TABLESPACE_NAME||' datafile '''||a.file_name||''' size 2m autoextend on maxsize 4m;'
+ from dba_data_files a, dba_tablespaces b where 
+a.Tablespace_name = b.tablespace_name and a.tablespace_name not in ('SYSTEM','SYSAUX','UNDOTBS1') and encrypted ='NO' and a.file_id in 
+ (select min(file_id) fileid from dba_data_files where tablespace_name not in ('SYSTEM','SYSAUX','UNDOTBS1') group by tablespace_name);
+
+spool off;
+
+Execute create_unencr_tablespace.sql on target database to create the unencrypted tablespaces.
+ON TARGET 
+@ create_unencr_tablespace.sql
+
+Create encrypted tablespaces
+
+ON SOURCE DATABASE
+Script to create encrypted tablespaces
+ 
+SET LINES 700 PAGES 700
+SET HEADING OFF
+SET FEEDBACK OFF
+SPOOL create_encr_tablespace.sql
+
+select 'CREATE TABLESPACE ' ||a.TABLESPACE_NAME||' datafile '''||a.file_name||''' SIZE 2M AUTOEXTEND ON MAXSIZE 4M
+ENCRYPTION DEFAULT STORAGE(ENCRYPT) SEGMENT SPACE MANAGEMENT AUTO;'
+from dba_data_files a, dba_tablespaces b where 
+a.Tablespace_name = b.tablespace_name and a.tablespace_name not in ('SYSTEM','SYSAUX','UNDOTBS1') and encrypted ='YES' and a.file_id in 
+ (select min(file_id) fileid from dba_data_files where tablespace_name not in ('SYSTEM','SYSAUX','UNDOTBS1') group by tablespace_name);
+
+spool off;
+
+Run create_encr_tablespace.sql on target database to create the unencrypted tablespaces
+ON TARGET 
+@ create_encr_tablespace.sql
+
+Add Datafiles
+
+ON SOURCE DATABASE
+
+Run this script on source database to generate DDL for adding datafile
+
+SET LINES 700 PAGES 700
+SET HEADING OFF
+SET FEEDBACK OFF
+SPOOL add_datafiles.sql
+
+SELECT 'ALTER TABLESPACE '||TABLESPACE_NAME|| ' ADD DATAFILE '''||file_name || ''' size 2m autoextend on maxsize 4m;' from dba_data_files a where tablespace_name not in ('SYS', 'SYSTEM', 'UNDOTBS01','USERS') and file_id not in (select min(file_id) fileid from dba_data_files where tablespace_name not in ('SYSTEM','SYSAUX','UNDOTBS1') group by  tablespace_name);
+
+spool off
+
+Run the add_datafiles.sql on target database
+
+ON TARGET 
+@add_datafiles.sql
+
+Add tempfiles
+ON SOURCE DATABASE
+
+Run this script on source database to generate DDL for adding tempfile to TEMP tablespace
+
+SET LINES 700 PAGES 700
+SET HEADING OFF
+SET FEEDBACK OFF
+SPOOL add_tempfile.sql
+
+SQL>  SELECT 'ALTER TABLESPACE TEMP ADD TEMPFILE '||NAME||' AUTOEXTEND ON MAXSIZE '|| BYTES/1024/1024|| 'M;' FROM V$TEMPFILE;
+
+spool off;
+
+Run add_tempfile.sql on the target database
+ON TARGET
+@ add_tempfile.sql
+
+Compare sizes of SYSTEM, SYSAUX and UNDO tablespaces
+ON TARGET AND SOURCE DATABASE
+
+Run the following query to compare the datafiles for SYSTEM, SYSAUX AND UNDO
+Sizes on target database should be greater or equal to that on source database
+
+Select sum(bytes/1024/1024/1024) as GB , 
+            tablespace_name 
+from dba_data_files 
+where tablespace_name in ('SYSTEM','SYSAUX', 'UNDOTBS1');
+2.1.9 Compare sizes of logfiles
+
+• The sizes of log files and number of members per log file group in the new target database should be the same as, or larger than, the source database.
+
+ON TARGET AND SOURCE – run the following query to compare
+
+set lines 200
+col member format a40
+col member format a60
+SELECT a.group#, 
+               b.STATUS,
+               a.MEMBER,  
+               b.BYTES/1024/1024 "Size (Mb)"
+ FROM v$logfile a, 
+             v$log b
+WHERE a.group# = b.group#;
+
+
+2.1.10 Compare Database Characterset
+
+• The source and target database must use the same character set and national character set. 
+   Check the source database character sets by issuing the following query:
+
+ON SOURCE DATABASE
+
+SQL> set lines 200
+SQL> select * from database_properties where property_name like '%CHARACTERSET';
+
+PROPERTY_NAME                           PROPERTY_VALUE                 DESCRIPTION
+------------------------------                   ------------------------------         ------------------------------
+NLS_NCHAR_CHARACTERSET       AL16UTF16                              NCHAR Character set
+NLS_CHARACTERSET                       US7ASCII                                 Character set
+
+
+If the characterset on target is a superset of that of source we would not need to change the characterset on target
+
+In case the target is not using the same character set, the following steps need to be followed to change characterset on target 
+
+ON TARGET DATABASE
+
+SQL> col property_value format a30
+SQL> col description format a25
+SQL> set lines 200
+SQL>  select * from database_properties where property_name like '%CHARACTERSET';
+
+Try to change character set on source directly. If it gives an error proceed with csscan and csalter commands
+
+SQL> alter database CHARACTER SET US7ASCII;
+alter database CHARACTER SET US7ASCII
+*
+ERROR at line 1:
+ORA-12712: new character set must be a superset of old character set
+
+Csminst.sql will be found in $ORACLE_HOME/rdbms/admin
+Create a copy of csminst.sql and changed default tablespace for csmig user in the script
+
+[oracle@goblxdvcsst admin]$ cp -p csminst.sql csminst_new.sql
+ [oracle@goblxdvcsst admin]$ vi csminst_new.sql
+[oracle@goblxdvcsst admin]$ "/ora1120/bin/sqlplus"  / as sysdba
+
+SQL>@csminst_new.sql
+
+
+Exit from sqlplus and run csscan
+
+ [oracle@goblxdvcsst lib]$ export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH
+
+[oracle@goblxdvcsst lib]$ "/ora1120/bin/csscan"  TABLE='(SYS.SQL_VERSION$)' FROMCHAR=WE8MSWIN1252  TOCHAR=US7ASCII LOG=instchkc CAPTURE=N PROCESS=1 ARRAY=1024000
+[oracle@goblxdvcsst lib]$ vi instchkc.err
+ [oracle@goblxdvcsst lib]$ vi instchkc.out
+ [oracle@goblxdvcsst lib]$ vi instchkc.txt
+[oracle@goblxdvcsst lib]$ vi instchkc.err
+
+
+Log in to sqlplus and change character set with csalter.plb
+
+SQL> col property_value format a30
+SQL> col description format a25
+SQL> set lines  200
+SQL> select * from database_properties where property_name like '%CHARACTERSET';
+
+PROPERTY_NAME                  PROPERTY_VALUE                 DESCRIPTION
+------------------------------ ------------------------------ -------------------------
+NLS_CHARACTERSET               WE8MSWIN1252                   Character set
+NLS_NCHAR_CHARACTERSET         AL16UTF16                      NCHAR Character set
+
+SQL> exit
+
+[oracle@goblxdvcsst lib]$ "/ora1120/bin/csscan" / AS SYSDBA FULL=Y
+
+Current database character set is WE8MSWIN1252.
+Enter new database character set name: > US7ASCII
+Enter array fetch buffer size: 1024000 >
+Enter number of scan processes to utilize(1..): 1 >
+Enumerating tables to scan...
+...................
+Scanner terminated successfully.
+
+Exit from sqlplus and log in again as sysdba
+
+[oracle@goblxdvcsst admin]$ "/ora1120/bin/sqlplus"  / as sysdba
+
+SQL> @$ORACLE_HOME/rdbms/admin/csalter.plb
+
+SQL> set lines 200
+SQL> col property_value format a30
+SQL>  col description format a25
+SQL> select * from database_properties where property_name like '%CHARACTERSET';
+
+PROPERTY_NAME                  PROPERTY_VALUE                 DESCRIPTION
+------------------------------ ------------------------------ -------------------------
+NLS_CHARACTERSET               US7ASCII                       Character set
+NLS_NCHAR_CHARACTERSET         AL16UTF16                      NCHAR Character set
+
+Drop user csmig
+
+SQL> startup restrict 
+SQL> alter system enable restricted session;
+system altered
+SQL> drop user csmig cascade;
+User dropped.
+
+
+SQL> alter system disable restricted session;
+system altered
+SQL> shutdown immediate
+SQL> startup
+
+
+2.1.11 Query the V$OPTION view to get currently installed database options.
+ 
+ON SOURCE AND TARGET DATABASE
+SQL> SELECT * FROM V$OPTION;
+
+
+2.1.12   Query DBA_REGISTRY to get currently installed database components.
+
+
+ON SOURCE AND TARGET DATABASE
+SQL> col comp_name format a40
+SQL> set lines 200
+SQL> select  COMP_ID ,COMP_NAME ,VERSION,STATUS   from dba_registry;
+
+COMP_ID                        COMP_NAME                                VERSION                        STATUS
+------------------------------ ---------------------------------------- ------------------------------ -----------
+CATALOG                        Oracle Database Catalog Views            11.2.0.3.0                     VALID
+CATPROC                        Oracle Database Packages and Types       11.2.0.3.0                     VALID
+
+2.2	    Prepare Target and Source Databases
+
+2.2.1	On the target database, create a database link from the target system to the source system and a directory for Data Pump use. 
+
+ON TARGET DATABASE
+
+Set streams_pool_size to at least 150m
+SQL> sho parameter streams_pool_size
+
+SQL> alter system set streams_pool_size=150m;
+
+SQL> create directory ttsdir as '/u01/app/oracle/admin/orcl/tts'; 
+
+SQL>GRANT SELECT ON "SYS"."DBA_DATA_FILES" TO "SYSTEM";
+
+SQL>GRANT READ ON DIRECTORY "SYS"."TTSDIR" TO "SYSTEM";
+
+SQL>GRANT WRITE ON DIRECTORY "SYS"."TTSDIR" TO "SYSTEM";
+
+SQL> !mkdir /u01/app/oracle/admin/orcl/tts
+
+SQL>connect SYSTEM/<password>
+
+SQL> CREATE DATABASE LINK "TTSLINK"  CONNECT TO "SYSTEM" IDENTIFIED BY ****  USING 'SOURCE_ORCL';
+
+2.2.2	On the source database, create a directory for Data Pump use.
+
+ON SOURCE DATABASE
+
+Set streams_pool_size to at least 150m
+
+SQL> sho parameter streams_pool_size
+SQL> alter system set streams_pool_size=150m;
+
+SQL> create directory ttsdir as '/u01/app/oracle/admin/orcl/tts'; 
+SQL>GRANT SELECT ON "SYS"."DBA_DATA_FILES" TO "SYSTEM";
+SQL>GRANT READ ON DIRECTORY "SYS"."TTSDIR" TO "SYSTEM";
+SQL>GRANT WRITE ON DIRECTORY "SYS"."TTSDIR" TO "SYSTEM";
+SQL> !mkdir /u01/app/oracle/admin/orcl/tts
+
+
+2.2.3	Create Metadata Required for XTTS
+
+Run Data Pump on the target system to import database metadata necessary for the transportable import. The database metadata import is run in network mode and pulls directly from the source database.
+
+On Target
+
+$ "/ora1120/bin/impdp" 'system/*****' directory=ttsdir logfile=dp_userimp.log network_link=ttslink full=y include=USER,ROLE,ROLE_GRANT,PROFILE
+
+
+
+2.2.4	Drop User Tablespaces
+
+Drop the placeholder tablespaces in the target database that were created when the target database was initially created by DBCA. 
+If the default permanent tablespace is one of the tablespaces that will be dropped from the target database because it will be transported, then first change the database default permanent tablespace.
+
+
+On Target database
+
+SQL> select property_value from database_properties where property_name = ’DEFAULT_PERMANENT_TABLESPACE’; 
+
+PROPERTY_VALUE
+--------------
+USERS 
+
+SQL> alter database default tablespace SYSTEM;
+Database altered.
+
+
+Following User tablespaces would need to be dropped if they are existing in the target database
+
+ON TARGET DATABASE
+
+SET LINES 700 PAGES 700
+SET HEADING OFF
+SET FEEDBACK OFF
+SPOOL drop_tablespace.sql
+
+select 'DROP TABLESPACE ' || tablespace_name || ' INCLUDING CONTENTS AND DATAFILES;' from dba_tablespaces where tablespace_name not in ('SYSTEM','SYSAUX')
+and contents = 'PERMANENT';
+
+spool off;
+
+Run drop_tablespace.sql on target database
+
+SQL>Set echo on serveroutput on feedback on heading on
+
+SQL>@drop_tablespace.sql
+
+2.2.5	TTS Violation Check
+
+On the source database, run the tts_check.sql script to perform the self-containment check and report violations.
+We have to fix the reported violations before proceeding
+
+ON SOURCE DATABASE
+
+SQL> declare
+ checklist varchar2(8000);
+  i number := 0;
+  begin
+  for ts in
+  (select tablespace_name
+  from dba_tablespaces
+  where tablespace_name not in ('SYSTEM','SYSAUX')
+  and contents = 'PERMANENT' and encrypted='NO')
+ loop
+ if (i=0) then
+ checklist := ts.tablespace_name;
+ else
+ checklist := checklist||','||ts.tablespace_name;
+ end if;
+ i := 1; end loop;
+ dbms_tts.transport_set_check(checklist,TRUE,TRUE);
+ end;
+ /
+
+SQL> select * from transport_set_violations;
+
+We would need to resolve all violations before proceeding further
+
+
+2.2.6   Export all metadata from the source database. 
+
+After the tablespaces are transported, the metadata will be imported into the target database to create metadata that was not transported. Do not perform any DDL changes after this step.
+
+
+ON SOURCE
+
+$ expdp system/password DIRECTORY=ttsdir LOGFILE=dp_fullexp_meta.log DUMPFILE=dp_full.dmp FULL=y CONTENT=METADATA_ONLY EXCLUDE =USER,ROLE,ROLE_GRANT,PROFILE
+
+
+
+
+
+
+
+Phase 3: PERFORM THE TRANSPORT 
+
+Perform the following steps on the source database to ready it for the transport process.
+
+
+3.1 Shutdown the application
+
+On source Database
+
+At this point disconnect users and shutdown all application server processes on source. Users cannot use any application served by the database until the migration to the new platform is complete.
+
+
+3.2   Export OLAP Analytic Workspaces 
+On Source database
+
+Since there are no OLAP Analytic Workspaces then we would skip this step
+
+SQL> select aw_name, owner, frozen from all_aws;
+no rows selected
+SQL>  select * From aw$;
+
+no rows selected
+
+
+3.3  Make All User Tablespaces READ ONLY
+
+
+ON SOURCE
+
+Make a note of all encrypted tablespaces
+SQL> select tablespace_name from dba_tablespaces where encrypted ='YES' order by tablespace_name;
+
+Objects in encrypted tablespaces
+
+SQL> select distinct SEGMENT_NAME, segment_type, owner from dba_segments where tablespace_name in (select tablespace_name from dba_tablespaces where encrypted ='YES');
+
+
+Total size of encrypted data
+
+SQL> select sum(bytes/1024/1024/1024) as gb from dba_data_files where tablespace_name in (select tablespace_name from dba_tablespaces where encrypted ='YES');
+
+
+Run this script to generate the DDL and then run the DDL generated on source database
+SET LINES 700 PAGES 700
+SET HEADING OFF
+SET FEEDBACK OFF
+SPOOL tbs_read_only.sql
+
+SQL> select 'ALTER TABLESPACE ' || tablespace_name || ' READ ONLY;' from dba_tablespaces where tablespace_name not in ('SYSTEM','SYSAUX') and contents = 'PERMANENT' AND ENCRYPTED='NO';
+
+SQL>spool off
+SQL>@tbs_read_only.sql
+
+
+
+3.4   Export Tablespaces from Source Database
+
+
+Transport the User Tablespaces
+
+Perform the following steps to perform the tablespace transport.
+
+Export the user tablespace metadata from the source database. The parameter file dp_ttsexp.par is created by running the cr_tts_parfiles.sql
+
+3.4.1	Steps for creating the parfile
+
+Create cr_tts_parfiles.sql and run it as sysdba 
+This will create the required par files for
+• XTTS export (dp_ttsexp.par)
+• XTTS import (dp_ttsimp.par)
+• Test tablespace metadata-only export (dp_tsmeta_exp_TESTONLY.par)
+
+Source: http://www.oracle.com/technetwork/database/features/availability/maa-wp-11g-platformmigrationtts-129269.pdf
+
+ON SOURCE DATABASE
+
+cr_tts_parfiles.sql
+
+Script for generating dp_ttsexp.par
+
+REM
+REM Create TTS Data Pump export and import PAR files
+REM
+set feedback off trimspool on
+set serveroutput on size 1000000
+REM
+REM Data Pump parameter file for TTS export
+REM
+spool dp_ttsexp.par
+declare
+tsname varchar(30);
+i number := 0;
+begin
+dbms_output.put_line('directory=ttsdir');
+dbms_output.put_line('dumpfile=dp_tts.dmp');
+dbms_output.put_line('logfile=dp_ttsexp.log');
+dbms_output.put_line('transport_full_check=no');
+dbms_output.put('transport_tablespaces=');
+for ts in
+(select tablespace_name from dba_tablespaces
+where tablespace_name not in ('SYSTEM','SYSAUX')
+and contents = 'PERMANENT' and encrypted='NO'
+order by tablespace_name)
+loop
+if (i!=0) then
+dbms_output.put_line(tsname||',');
+end if;
+i := 1;
+tsname := ts.tablespace_name;
+end loop;
+dbms_output.put_line(tsname);
+dbms_output.put_line('');
+end;
+/
+spool off
+
+
+
+------------------------------------------------------------------------------------------------------------------------------
+
+Script for generating dp_ttsimp.par
+
+REM
+REM Data Pump parameter file for TTS import
+REM
+spool dp_ttsimp.par
+declare
+fname varchar(513);
+i number := 0;
+begin
+dbms_output.put_line('directory=ttsdir');
+dbms_output.put_line('dumpfile=dp_tts.dmp');
+dbms_output.put_line('logfile=dp_ttsimp.log');
+dbms_output.put('transport_datafiles=');
+for df in
+(select file_name from dba_tablespaces a, dba_data_files b
+where a.tablespace_name = b.tablespace_name
+and a.tablespace_name not in ('SYSTEM','SYSAUX')
+and contents = 'PERMANENT' and encrypted='NO'
+order by a.tablespace_name)
+loop
+if (i!=0) then
+dbms_output.put_line(''''||fname||''',');
+end if;
+i := 1;
+fname := df.file_name;
+end loop;
+dbms_output.put_line(''''||fname||'''');
+dbms_output.put_line('');
+end;
+/
+spool off
+
+
+
+------------------------------------------------------------------------------------------------------------------------------
+
+
+Script for generating dp_tsmeta_exp_TESTONLY.par
+
+REM
+REM Data Pump parameter file for tablespace metadata export
+REM Only use this to estimate the TTS export time
+REM
+spool dp_tsmeta_exp_TESTONLY.par
+declare
+tsname varchar(30);
+i number := 0;
+begin
+dbms_output.put_line('directory=ttsdir');
+dbms_output.put_line('dumpfile=dp_tsmeta_TESTONLY.dmp');
+
+dbms_output.put_line('logfile=dp_tsmeta_exp_TESTONLY.log');
+dbms_output.put_line('content=metadata_only');
+dbms_output.put('tablespaces=');
+for ts in
+(select tablespace_name from dba_tablespaces
+where tablespace_name not in ('SYSTEM','SYSAUX')
+and contents = 'PERMANENT' and encrypted='NO'
+order by tablespace_name)
+loop
+if (i!=0) then
+dbms_output.put_line(tsname||',');
+end if;
+i := 1;
+tsname := ts.tablespace_name;
+end loop;
+dbms_output.put_line(tsname);
+dbms_output.put_line('');
+end;
+/
+spool off
+
+
+
+Copy all the parfiles generated to the TTSDIR location on the SOURCE server
+
+
+3.4.2    To estimate transportable export time, run the following Data Pump Export command:
+
+On source database 
+Use PARALLEL option for datapump export to make it faster
+
+dp_tsmeta_exp_TESTONLY.par is generated by running the above commands for extracting parameter files.
+
+
+ON SOURCE
+$ expdp system/<password> parfile=dp_tsmeta_exp_TESTONLY.par
+
+This command performs a non transportable, metadata-only tablespace export of the tablespaces to be transported.
+
+3.4.3     Run EXPORT on source database
+dp_ttsexp.par is generated by running the above commands for extracting parameter files.
+
+On source database 
+Use PARALLEL option for datapump export to make it faster
+
+
+$ expdp system/password PARFILE=dp_ttsexp.par
+
+
+Copy all the dump files and parfiles generated from TTSDIR location on source to TTSDIR location on target
+
+
+ON SOURCE
+
+SQL>SET LINES 700 PAGES 700
+SQL>SET HEADING OFF
+SQL>SET FEEDBACK OFF
+SQL>SPOOL copy_datafiles.lst
+
+
+SQL>select 'scp -p ' ||file_name || ' oracle@goblxdvcsst:'||file_name from dba_tablespaces a, dba_data_files b where a.tablespace_name = b.tablespace_name and a.tablespace_name not in ('SYSTEM','SYSAUX') and contents = 'PERMANENT' and ENCRYPTED='NO' order by a.tablespace_name;
+
+SQL>spool off
+
+edit the copy_datafiles.lst and create several shell scripts for copying datafiles in a similar manner as shown below. E.g. 1_copy_datafiles.sh, 2_copy_datafiles.sh, 3_copy_datafiles.sh, ........
+
+1_copy_datafiles.sh
+
+c_begin_time_sec=`date +%s`
+date
+du -sh /oradata03/orcl/ ; du -sh /oradata03/orcl/
+df -h /oradata03/orcl/ ; df -k /oradata03/orcl/
+
+echo copying datafiles
+
+scp -p /oradata05/orcl/PART_ASSM_1_01.dbf goblxdvcsst:/oradata05/orcl/PART_ASSM_1_01.dbf
+scp -p /oradata05/orcl/PART_ASSM_2_01.dbf goblxdvcsst:/oradata05/orcl/PART_ASSM_2_01.dbf
+scp -p /oradata05/orcl/PART_ASSM_2_05.dbf goblxdvcsst:/oradata05/orcl/PART_ASSM_2_05.dbf
+
+eho completed
+date
+c_end_time_sec=`date +%s`
+v_total_execution_time_sec=`expr ${c_end_time_sec} - ${c_begin_time_sec}`
+echo Time $v_total_execution_time_sec
+
+
+
+execute the shell scripts one by one with the following command
+
+id ; pwd ; hostname ; date ; cat ./1_copy_datafiles.sh  ; nohup ./1_copy_datafiles.sh 2>&1 1>>./1_copy_datafiles.sh.01.log &
+
+
+
+
+3.4.4   RMAN Convert Datafile
+
+Run the RMAN CONVERT DATAFILE command on the target system to convert the datafiles to the new endian format and place the converted copy in its final destination on the target system.
+ 
+Have a about 200-300 GB space created separately on target machine for RMAN datafile conversion. (/rman_convert) 
+
+Best practice is to create an excel sheet with the list of datafiles to be converted with their sizes
+This list can be obtained from the Source database
+
+ON SOURCE
+
+Select file_name, bytes/1024/1024/1024 as GB from dba_data_files a, dba_tablespaces  b where a.tablespace_name = b.tablespace_name and encrypted='NO' order by file_name;
+
+
+Specify the datafiles of all tablespaces being transported. 
+
+Create several scripts for RMAN convert and take care that  the total size of all the datafiles to be converted at a time in one script does not exceed the size of the filesystem (/rman_convert i.e. 200-300 GB)
+
+ON TARGET SYSTEM
+SAMPLE RMAN CONVERT SHELL SCRIPT
+1a_rman_convert.sh
+
+
+c_begin_time_sec=`date +%s`
+date
+du -sh /rman_convert/orcl/ ; du -sk /rman_convert/orcl/
+df -h /rman_convert/orcl/ ; df -k /rman_convert/orcl/
+
+export ORACLE_SID=orcl
+export ORACLE_HOME=/ora1120
+echo Starting RMAN datafile conversion
+"/ora1120/bin/rman" target / <<EOF
+CONVERT DATAFILE '/oradata04/orcl/batch_assm_01.dbf',
+'/oradata04/orcl/cde_10.dbf',
+'/oradata04/orcl/data_extra_small_assm_18.dbf',
+'/oradata04/orcl/data_extra_small_assm_7.dbf',
+'/oradata04/orcl/data_extra_small_assm_8.dbf',
+'/oradata04/orcl/data_large_assm_1.dbf',
+'/oradata04/orcl/PART_NDX_SMALL_ASSM_4_01.dbf',
+'/oradata04/orcl/PART_NDX_SMALL_ASSM_5_01.dbf' FROM PLATFORM 'HP-UX IA (64-bit)'  PARALLELISM 8 DB_FILE_NAME_CONVERT '/oradata04/','/rman_convert/';
+EOF
+date
+echo Completed RMAN conversion
+
+date
+du -sh /rman_convert/orcl/ ; du -sk /rman_convert/orcl/
+df -h /rman_convert/orcl/ ; df -k /rman_convert/orcl/
+c_end_time_sec=`date +%s`
+v_total_execution_time_sec=`expr ${c_end_time_sec} - ${c_begin_time_sec}`
+echo Time $v_total_execution_time_sec
+
+
+
+Due to lack of space we will have to move the converted datafiles from /rman_convert folder to their respective locations before proceeding to next rman convert script
+
+SAMPLE MOVE DATAFILES SHELL SCRIPT
+
+1b_move_datafiles.sh
+
+First we will have to remove the old datafiles from original location
+Then we have to move the converted datafiles from /rman_convert to their original location
+Make sure the 1b_move_datafiles.sh script corresponds with list of datafiles as that used in 1a_rman-convert.sh
+
+
+c_begin_time_sec=`date +%s`
+date
+du -sh /oradata03/orcl/ ; du -sh /oradata03/orcl/
+df -h /oradata03/orcl/ ; df -k /oradata03/orcl/
+
+echo deleting datafiles
+rm /oradata04/orcl/batch_assm_01.dbf
+rm /oradata04/orcl/cde_10.dbf
+rm /oradata04/orcl/data_extra_small_assm_18.dbf
+rm /oradata04/orcl/data_extra_small_assm_7.dbf
+rm /oradata04/orcl/data_extra_small_assm_8.dbf
+rm /oradata04/orcl/data_large_assm_1.dbf
+rm /oradata04/orcl/PART_NDX_SMALL_ASSM_4_01.dbf
+rm /oradata04/orcl/PART_NDX_SMALL_ASSM_5_01.dbf
+
+
+du -sh /oradata03/orcl/ ; du -sh /oradata03/orcl/
+df -h /oradata03/orcl/ ; df -k /oradata03/orcl/
+du -sh /rman_convert/orcl/ ; du -sk /rman_convert/orcl/
+df -h /rman_convert/orcl/ ; df -k /rman_convert/orcl/
+date
+
+echo moving datafiles
+mv /rman_convert/orcl/batch_assm_01.dbf  /oradata04/orcl/batch_assm_01.dbf
+mv / rman_convert /orcl/cde_10.dbf  /oradata04/orcl/cde_10.dbf
+mv / rman_convert /orcl/data_extra_small_assm_18.dbf  /oradata04/orcl/data_extra_small_assm_18.dbf
+mv / rman_convert /orcl/data_extra_small_assm_7.dbf /oradata04/orcl/data_extra_small_assm_7.dbf
+mv / rman_convert /orcl/data_extra_small_assm_8.dbf /oradata04/orcl/data_extra_small_assm_8.dbf
+mv / rman_convert /orcl/data_large_assm_1.dbf /oradata04/orcl/data_large_assm_1.dbf
+mv / rman_convert /orcl/PART_NDX_SMALL_ASSM_4_01.dbf /oradata04/orcl/PART_NDX_SMALL_ASSM_4_01.dbf
+mv / rman_convert /orcl/PART_NDX_SMALL_ASSM_5_01.dbf /oradata04/orcl/PART_NDX_SMALL_ASSM_5_01.dbg
+
+echo Completed
+
+date
+du -sh /rman_convert/orcl/ ; du -sk /rman_convert/orcl/
+df -h /rman_convert/orcl/ ; df -k /rman_convert/orcl/
+c_end_time_sec=`date +%s`
+v_total_execution_time_sec=`expr ${c_end_time_sec} - ${c_begin_time_sec}`
+echo Time $v_total_execution_time_sec
+
+
+
+run the scripts in the following order
+
+1a_rman_convert.sh  
+
+id ; pwd ; hostname ; date ; cat ./1a_rman_convert.sh  ; nohup ./1a_rman_convert.sh 2>&1 1>>./1a_rman_convert.sh.01.log &
+
+check the 1a_rman_convert.sh.01.log before proceeding to run 1b_move_datafiles.sh  
+if the log shows errors first resolve the errors and then only execute 1b_move_datafiles.sh 
+ 
+1b_move_datafiles.sh  
+
+id ; pwd ; hostname ; date ; cat ./1b_move_datafiles.sh  ; nohup ./1b_move_datafiles.sh 2>&1 1>>./1b_move_datafiles.01.log &
+
+
+
+
+3.4.5 Migrate objects in encrypted tablespaces
+
+
+ON SOURCE
+
+SQL> select distinct SEGMENT_NAME from dba_segments where segment_type='TABLE' AND tablespace_name in (select tablespace_name from dba_tablespaces where encrypted ='YES');
+
+Create a parameter file exp_encr_tables.par for export from results in the above query.
+
+directory=ttsdir
+dumpfile=dp_encr_tables.dmp
+logfile=dp_encr_tables.log
+schemas=P1PROD
+include=TABLE:"IN ('COLLECTION_INFO',
+'DEBTOR_HISTORY',
+'OUTBOUND_CALLING',
+'PEND_EFT_ENROLL'
+)"
+
+
+ON SOURCE EXECUTE DATAPUMP EXPORT
+
+expdp system/*** parfile=exp_encr_tables.par
+
+
+
+ON TARGET 
+
+Copy the parameter file and dumpfile to target system and execute a datapump import
+
+$ "/ora1120/bin/impdp" system/*** parfile=exp_encr_tables.par
+
+
+Make sure all objects including triggers, synonyms, table partitions and indexes are imported by comparing the database on target and source
+
+ON TARGET AND SOURCE EXECUTE AND COMPARE
+
+select distinct SEGMENT_NAME from dba_segments where segment_type='TABLE' AND tablespace_name in (select tablespace_name from dba_tablespaces where encrypted ='YES');
+
+
+
+
+
+3.4.6 Create synomyms
+
+ON SOURCE
+
+SET long 1000
+SET serveroutput on
+set echo on
+SET verify off lines 132
+spool create_synonym.sql
+DECLARE
+   v_output         CLOB          := NULL;
+
+BEGIN
+   DBMS_OUTPUT.put_line ('DDL For Database Synonyms');
+
+   FOR tt IN (SELECT owner, synonym_name
+                FROM dba_synonyms
+               WHERE table_owner not in (select name from system.logstdby$skip_support where action=0))
+   LOOP
+      SELECT DBMS_METADATA.get_ddl ('SYNONYM', tt.synonym_name, tt.owner)
+        INTO v_output
+        FROM DUAL;
+
+      DBMS_OUTPUT.put_line (v_output||';');
+   END LOOP;
+END;
+/
+
+Spool off
+
+Execute the create_synonym.sql on target system
+
+
+Create all synonyms on target 
+
+
+ON TARGET DATABASE
+$ impdp system PARFILE=dp_ttsimp.par
+
+Review the tts_exp.log file for errors.
+
+
+
+3.4.7 Create missing triggers
+
+Create any missing triggers that were not created during the import. Refer to import logs for errors on triggers.
+
+On source
+
+SET long 1000
+SET serveroutput on
+set echo on
+SET verify off lines 132
+spool create_missing_triggers.sql
+
+SQL> DECLARE
+       v_output         CLOB          := NULL;
+    BEGIN
+       DBMS_OUTPUT.put_line ('DDL For triggers');
+       FOR tt IN (SELECT owner, trigger_name
+                    FROM dba_triggers
+                   WHERE trigger_name in ('TRDW_AU_INTERVAL',
+   'TRDW_AIU_AGENT_DIV_ACCT',
+   'TRDW_AIU_CRITICAL_ACCT',
+   'TRDW_AU_CONTRACTS',
+   'TRDW_AI_ADDRESSES') and owner = 'EDWSHADOW')
+      LOOP
+         SELECT DBMS_METADATA.get_ddl ('TRIGGER', tt.trigger_name, tt.owner)
+           INTO v_output
+          FROM DUAL;
+         DBMS_OUTPUT.put_line (v_output||';');
+      END LOOP;
+   END;
+   /
+
+Spool off;
+
+Execute create_missing_triggers.sql on target database
+
+ON TARGET
+SQL>@ create_missing_triggers.sql
+
+
+
+3.5    Perform Post-Transport Actions on the Target Database
+
+3.5.1   Make User Tablespaces READ WRITE on the Target Database
+
+On Target database
+
+Convert tablespaces to read write
+ON TARGET
+
+SET long 1000
+SET  feedback off heading off
+SET verify off lines 132
+spool tbs_read_write.sql
+
+select 'ALTER TABLESPACE ' ||TABLESPACE_NAME|| ' READ WRITE;' FROM DBA_TABLESPACES WHERE STATUS='READ ONLY';
+
+spool off;
+
+run the tbs_read_write.sql on target database and also on source database
+
+
+Run the DDL that is generated on target database
+E.g. ALTER TABLESPACE TOOLS READ WRITE;
+
+
+3.5.2	 Import Source Database Metadata into Target Database
+
+After the tablespaces are imported into the target database, import the remaining database metadata from the source database:
+
+$ impdp system/password DIRECTORY=ttsdir LOGFILE=dp_fullimp.log DUMPFILE=dp_full.dmp FULL=y
+
+Review the tts_dpnet_fullimp.log file for errors. 
+
+It is possible that errors or warnings can be ignored. 
+
+However, you must investigate any reported errors and ignore errors only when you understand the source of the message and have assessed its impact.
+
+
+
+3.5.3  Create system privileges in the target database
+
+Run tts_sys_privs.sql to create system privileges:
+Source: http://www.oracle.com/technetwork/database/features/availability/maa-wp-11g-platformmigrationtts-129269.pdf
+
+ON SOURCE
+
+SQL>SET long 1000
+SQL>SET  feedback off heading off
+SQL>SET verify off lines 132
+SQL>spool tts_sys_privs.sql
+
+
+SQL>select 'grant '||privilege||' on "'||owner||'"."'||table_name||'" to "'||grantee||'"'||decode(grantable,'YES',' with grant option ')||decode(hierarchy,'YES',' with hierarchy option ')||';'
+from dba_tab_privs where owner in (select name from system.logstdby$skip_support where action=0)
+and grantee in (select username from dba_users where username not in (select name from system.logstdby$skip_support where action=0));
+spool off
+
+
+Run the above DDL generated on target database
+
+ON TARGET
+
+SQL>@tts_sys_privs.sql
+
+
+3.5.4	Fix Sequence Values
+
+Sequences may have values in the target database that do not match the source database because the sequences were referenced after the dictionary export was created. The supported method of resetting a sequence to a different starting  value is to drop and recreate the sequence. 
+
+We have already generated script tts_create_seq.sql, (created in Gather Sequence Information
+Step) to drop and re-create sequences based on the values in the source database. 
+On target database – run the DDL generated in script tts_create_seq.sql
+
+
+Gather Sequence Information
+
+Create tts_create_seq.sql script from the source database. 
+Use the DDL generated to reset the proper starting value for sequences on the target database. 
+On Source Database
+
+ON SOURCE
+
+SQL> @cr_tts_create_seq.sql
+Source: http://www.oracle.com/technetwork/database/features/availability/maa-wp-11g-platformmigrationtts-129269.pdf
+
+Or 
+
+SQL> set heading off feedback off trimspool on escape off
+SQL> set long 1000 linesize 1000 pagesize 0
+SQL> col SEQDDL format A300
+SQL> set heading off feedback of 
+SQL>set lines 750 pages 750
+SQL> set long 1000000
+SQL> spool create_sequence.sql
+SQL> select regexp_replace(
+dbms_metadata.get_ddl('SEQUENCE',sequence_name,sequence_owner),
+  2    3  '^.*(CREATE SEQUENCE.*CYCLE).*$',
+  4  'DROP SEQUENCE "'||sequence_owner||'"."'||sequence_name
+||'";'||chr(10)||'\1;') SEQDDL
+from dba_sequences
+ where sequence_owner not in
+    (select name
+   from system.logstdby$skip_support
+  where action=0) AND SEQUENCE_NAME LIKE ‘CDE_TIMESTAMP’;
+
+SQL> spool off
+
+
+Please note that the drop sequence is not created with the above script. We can create a drop_sequence.sql from the create create_sequence.sql 
+
+
+ON TARGET
+
+The order for running the script will be 
+
+1)	Drop_sequence.sql
+       Drop sequence “<OWNER>”.”<SEQUENCE_NAME>”;
+E.g. DROP SEQUENCE "ACTIONALERT"."SAL_ALERT";
+
+2)	Create_sequence.sql
+       Create sequence “<OWNER>”.”<SEQUENCE_NAME>” minvalue 1 maxvalue 9999999999999999    increment by 1 start with <lastval> cache 20 order nocycle;
+
+E.g. CREATE SEQUENCE  "ACTIONALERT"."SAL_ALERT"  MINVALUE 1 MAXVALUE 999999999999999999999999999 INCREMENT BY 1 START WITH 22541 CACHE 20 ORDER  NOCYCLE;
+
+Note: I noticed that the drop sequence DDL was not generated with the help of the above script. I created that myself
+
+
+3.5.5	Compile Invalid Objects
+
+ON TARGET
+
+Run $ORACLE_HOME/rdbms/admin/utlrp.sql to compile invalid objects:
+SQL> @?/rdbms/admin/utlrp.sql
+
+
+3.5.6	Import OLAP Analytic Workspaces - (this is not required in our case)
+
+Import OLAP analytic workspaces (AWs) exported previously using the DBMS_AW.EXECUTE PL/SQL procedure. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Phase 4: VERIFY AND BACKUP THE NEW TARGET DATABASE
+
+Once the transport process is finished, verify that the target database is complete and functional, and it is open and available. 
+
+Once the target database and application verification completes successfully, users can connect for normal operation.
+
+4.1   Gather Verification Information from Source Database
+
+Following the transport process, validate the target database contents to ensure the necessary data and metadata exists for the application to run correctly. The complete information required for proper verification will differ depending on the application and database, but minimally should include a list of the following:
+• Segment owners and types
+• Object owners and types
+• Invalid objects
+
+Do not use the number and types of objects owned by SYS or SYSTEM or other Oracle internal schemas that are not transportable for verification between the source and target databases
+
+Script tts_verify.sql can be run on the target database as an example of the information that may be required to compare the source and target databases. 
+
+
+On Target Database
+
+For example:
+Script to compare segment, object, and invalid object counts between two databases. This script should be run on the target database.
+
+This script requires a database link named ttslink between the  source and target databases.
+
+Run tts_verify.sql to create system privileges:
+
+Tts_verify.sql 
+(Source: http://www.oracle.com/technetwork/database/features/availability/maa-wp-11g-platformmigrationtts-129269.pdf)
+
+REM 
+REM Script to compare segment, object, and invalid object counts 
+REM between two databases. This script should be run on the target 
+REM database. 
+REM 
+REM This script requires a database link named ttslink between the 
+REM source and target databases. 
+REM 
+set heading off feedback off trimspool on linesize 500 
+spool tts_verify.out 
+prompt 
+prompt Segment count comparison across dblink 
+prompt 
+select r.owner, r.segment_type, r.remote_cnt Source_Cnt, l.local_cnt Target_Cnt 
+from ( select owner, segment_type, count(owner) remote_cnt 
+from dba_segments@ttslink 
+where owner not in 
+(select name 
+from system.logstdby$skip_support 
+where action=0) group by owner, segment_type ) r 
+, ( select owner, segment_type, count(owner) local_cnt 
+from dba_segments 
+where owner not in 
+(select name 
+from system.logstdby$skip_support 
+where action=0) group by owner, segment_type ) l 
+where l.owner (+) = r.owner 
+and l.segment_type (+) = r.segment_type 
+and nvl(l.local_cnt,-1) != r.remote_cnt
+order by 1, 3 desc 
+/ 
+
+
+prompt 
+prompt Object count comparison across dblink 
+prompt 
+select r.owner, r.object_type, r.remote_cnt Source_Cnt, l.local_cnt Target_Cnt 
+from ( select owner, object_type, count(owner) remote_cnt 
+from dba_objects@ttslink 
+where owner not in 
+(select name 
+from system.logstdby$skip_support 
+where action=0) group by owner, object_type ) r 
+, ( select owner, object_type, count(owner) local_cnt 
+from dba_objects 
+where owner not in 
+(select name 
+from system.logstdby$skip_support 
+where action=0) group by owner, object_type ) l 
+where l.owner (+) = r.owner 
+and l.object_type (+) = r.object_type 
+and nvl(l.local_cnt,-1) != r.remote_cnt 
+order by 1, 3 desc 
+/ 
+
+
+prompt 
+prompt Invalid object count comparison across dblink 
+prompt 
+select l.owner, l.object_type, r.remote_cnt Source_Cnt, l.local_cnt Target_Cnt 
+from ( select owner, object_type, count(owner) remote_cnt 
+from dba_objects@ttslink 
+where owner not in 
+(select name 
+from system.logstdby$skip_support 
+where action=0) and status='INVALID' 
+group by owner, object_type ) r 
+, ( select owner, object_type, count(owner) local_cnt 
+from dba_objects 
+where owner not in 
+(select name 
+from system.logstdby$skip_support 
+where action=0) and status='INVALID' 
+group by owner, object_type ) l 
+where l.owner = r.owner (+) 
+and l.object_type = r.object_type (+) 
+and l.local_cnt != nvl(r.remote_cnt,-1) 
+order by 1, 3 desc 
+/ 
+spool off
+
+
+
+SQL> connect system/<password>
+
+SQL> @tts_verify.sql
+
+
+
+4.2   Perform Application-specific Verification
+
+It is necessary that you test application functionality against the target database prior to allowing full-scale use.
+
+4.3    Verify and Gather Optimizer Statistics
+Optimizer statistics may no longer be complete or accurate. Gathering new optimizer statistics may be necessary.
+
+
+4.4   Backup the target database
+
+Once verification has completed successfully, the final step is to perform a backup of the newly upgraded target database. Perform an online backup while the database is made available for use.
+
+ON TARGET DATABASE
+
+Perform RMAN check for logical corruption. This is the best way to ensure that you will get a good backup.
+
+RMAN> backup check logical database;
+
+Once the check is completed
+
+RMAN> backup database;
+
+4.5     Verify the Transported Datafiles 
+
+As an additional validation, run DBVERIFY against all transported datafiles to perform data and index block verification. DBVERIFY can have high I/O requirements, so assess the database impact before validating all transported datafiles, particularly if multiple DBVERIFY commands are run simultaneously. 
+ON TARGET DATABASE
+$ dbv FILE=/oradata/ORCL/datafile/o1_mf_content_1wbq9rmd_.dbf 
+$ dbv FILE=/oradata/ORCL/datafile/o1_mf_users_1wbqls2r_.dbf
+
+4.6    Start the Application 
+
+The final step is to start the application, directing connections to the database running on the new target platform.
+
+References
+
+www.oracle.com/technetwork/database/features/availability/maa-wp-11g-platformmigrationtts-129269.pdf
+
+Platform Migration Using Transportable Tablespaces: Oracle Database 11g Release 1 
+Oracle Maximum Availability Architecture White Paper 
+February 2009
+
+
+http://www.oracle.com/technetwork/database/features/availability/thehartfordprofile-xtts-133180.pdf
+
+Oracle Database 10g and Multi-Terabyte Database Migration
+By: Saravanan Shanmugam and James Madison, The Hartford (http://www.thehartford.com/)
